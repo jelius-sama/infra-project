@@ -3,45 +3,101 @@ title: Forgejo Git Server
 description: Architecture and storage setup for my localized Forgejo instance.
 ---
 
-My Git server is powered by Forgejo and uses a dedicated local [Postgres](./postgres) database. To maximize security and containment, the entire stack runs under a single localized `git` user. Absolutely no files or processes require root-level ownership, keeping the system securely compartmentalized in the `/home/git` directory.
+My Git server is powered by [Forgejo](https://forgejo.org/), a self-hosted, community-run fork of Gitea, backed by a dedicated local [Postgres](./postgres) database. The whole stack — Forgejo itself, the SSH daemon it front-ends for repo access, and the storage mount underneath it — runs entirely under a single, unprivileged local user: `git`. No file in this stack is owned by `root`, no process runs as `root`, and no part of the request path (SSH clone/push, HTTP web UI, LFS transfer) ever needs to escalate privileges. Everything lives inside `/home/git`, which keeps the entire service compartmentalized: if the `git` user were ever compromised, the blast radius is contained to that user's home directory and whatever it has explicit access to (a single Postgres role/database, and read/write to one S3 bucket) — not the rest of the host.
+
+### Why S3 instead of EBS
+
+The obvious "default" way to back a Git server on a VPS/EC2 host is a local or EBS-backed volume: fast, simple, POSIX-native, no network hop. I deliberately didn't do that, for one main reason: **capacity planning**.
+
+- The EBS volume backing `/home/git` is currently capped at **2GB**. That's intentionally small — it's sized for the the Forgejo binary, config, logs, and the local FUSE cache, not for repository data itself.
+- Git repositories (especially with LFS-tracked binary assets, or long-lived history on active projects) grow indefinitely and unpredictably. Provisioning EBS for that means either over-provisioning up front and paying for headroom I may never use, or babysitting disk usage and resizing volumes under pressure — both of which are exactly the kind of operational overhead this whole self-hosted stack is trying to avoid.
+- S3 has no volume to resize and no capacity ceiling I need to plan around. I can mirror or clone repositories on the order of the Linux kernel (~10GB or so) without checking free space first, because the actual bytes live in the bucket, not on the attached disk. The trade-off is latency: S3-backed I/O over `rclone`/FUSE is measurably slower than local NVMe/EBS for cold reads, especially for operations that walk lots of small objects (like `git gc`, `git fsck`, or a full clone of a repo with a deep, unpacked object store). For my usage pattern — a personal/small-team Git server, not a high-throughput CI target — that latency trade-off is acceptable in exchange for never thinking about storage limits again.
+- Durability is also a quiet win here: S3 gives me eleven-nines-class object durability essentially for free, versus a single EBS volume being a single point of failure unless I'm separately managing snapshots.
+
+The **1500MB `--vfs-cache-max-size`** cap (detailed below) is sized specifically against that 2GB EBS ceiling — it leaves comfortable headroom (see [Rclone & Storage Architecture](#rclone--storage-architecture)) without the cache itself becoming the thing that fills the disk.
 
 ### Rclone & Storage Architecture
 
-All stateful data, including Forgejo data, LFS, and repositories, resides remotely in an S3 bucket. I mount this bucket directly to my local filesystem at `/home/git/fjo-s3fs` using `rclone` and FUSE. 
+All stateful Forgejo data — the Forgejo application data directory, Git LFS objects, and the bare repositories themselves — lives remotely in an S3 bucket, not on local disk. I mount that bucket into the local filesystem at `/home/git/fjo-s3fs` using [`rclone mount`](https://rclone.org/commands/rclone_mount/) over FUSE, connecting to the bucket through an S3 endpoint. Concretely, the mount is a systemd **user** service (`fjo-s3fs.service`) running as the `git` user, invoking `rclone mount fjo-s3fs:<bucket> /home/git/fjo-s3fs`.
 
-Because this setup runs entirely in user-space, I use systemd lingering (`sudo loginctl enable-linger git`) to keep the user and its background services active continuously. If I need to check the status from my admin account, I can manage the mount service using `sudo systemctl --user -M git@ status fjo-s3fs`.
+I specifically use `rclone mount`, not `s3fs-fuse` or `goofys`. The short version of why: `rclone`'s VFS layer gives me a real local write-back cache with configurable eviction (see below), it's the same tool I'd reach for anyway for scripted bucket operations elsewhere in this infra, and it's actively maintained with broad S3-compatible backend support (so swapping the underlying object store later, if I ever needed to, wouldn't mean re-architecting this).
 
-### Cache & Git Compatibility
+#### Why user-space, and why lingering is required
 
-To ensure high performance over the network, I aggressively cache the FUSE mount using the following `rclone` flags:
+Because the `git` user owns everything here — including the mount itself — the `fjo-s3fs` mount and the Forgejo process are both **user-level** systemd units (`systemctl --user`), not system-level units running as `root`. This is the direct consequence of the single-user containment model: a system-level unit would need root privilege to install/manage, which is exactly what this setup avoids.
+
+The catch with user-level systemd units is that by default, they're tied to an active login session — when the last session for a user ends, systemd tears down that user's manager and everything running under it, including "background" services like this mount. Since `git` is a service account that's never interactively logged in under normal operation, its user services would never actually stay running.
+
+**Systemd lingering** solves this: `sudo loginctl enable-linger git` tells systemd-logind to start the `git` user's systemd instance at boot (or immediately, if run against an already-booted system) and keep it running independent of any login session. This is a one-time, `root`-performed setup step — it's the one place `root` touches this stack — but it doesn't grant the `git` account any elevated privilege; it only tells the *init system* to treat `git`'s user manager as persistent infrastructure rather than a session artifact.
+
+With lingering enabled, both `fjo-s3fs.service` and the Forgejo web service survive host reboots and come back up automatically, exactly as if they were system services — just still scoped entirely to the `git` user.
+
+Because these are user services, they aren't visible or manageable via the normal `systemctl status <unit>` from an admin account — the `-M git@` machine-scope flag is required to reach into the `git` user's own systemd instance:
 
 ```bash
---file-perms 0755 \
---vfs-cache-mode full \
---vfs-write-back 5s \
---cache-dir /home/git/.local/state/fjo-s3fs-cache \
---vfs-cache-max-size 1500M \
---vfs-cache-max-age 24h
+sudo systemctl --user -M git@ status fjo-s3fs
+sudo systemctl --user -M git@ status forgejo
+```
+#### Cache tuning
+
+To keep Git operations fast despite the S3 backend sitting behind a network hop, the mount runs with an aggressive local VFS cache:
+
+```bash
+rclone mount fjo-s3fs:<bucket> /home/git/fjo-s3fs \
+  --file-perms 0755 \
+  --vfs-cache-mode full \
+  --vfs-write-back 5s \
+  --cache-dir /home/git/.local/state/fjo-s3fs-cache \
+  --vfs-cache-max-size 1500M \
+  --vfs-cache-max-age 24h
 ```
 
-* The `--file-perms 0755` flag is strictly required because Git needs executable permissions to run internal repository hooks.
+What each flag is actually doing:
+
+- **`--vfs-cache-mode full`** — the most aggressive of rclone's four VFS cache modes (`off`, `minimal`, `writes`, `full`). In `full` mode, any file that's read or written gets copied into the local on-disk cache in its entirety and kept there, with reads/writes served from the local copy rather than round-tripping to S3 per-operation. This is what makes repeated operations against the same repo (successive `git fetch`/`push`, Forgejo re-reading its own config/data files) fast after the first access — without it (`minimal` or `writes` mode), random-access reads against remote objects would be far slower, and Git specifically does a lot of seeking within pack files that punishes non-local-cached random access.
+- **`--vfs-write-back 5s`** — how long a modified file sits in the local cache before rclone uploads it back to S3. A short 5-second window keeps data close to durable quickly, at the cost of doing more, smaller upload requests than a longer write-back window would. This is a latency/durability trade-off: a longer write-back would batch writes more efficiently but widens the window where a host crash could lose recent writes that never made it to S3.
+
+- **`--cache-dir /home/git/.local/state/fjo-s3fs-cache`** — local, on-EBS scratch space for the cache. Following the XDG state-directory convention (`~/.local/state`) rather than dumping it in `$HOME` directly.
+- **`--vfs-cache-max-size 1500M`** — hard cap on how large that local cache directory is allowed to grow, with rclone evicting least-recently-used entries once the cap is hit. Sized deliberately below the 2GB EBS ceiling on `/home/git` (see [Why S3 instead of EBS](#why-s3-instead-of-ebs)) so the cache can never itself become the reason the disk fills up. Because eviction is LRU-based and the underlying source of truth is always S3, this cap being far smaller than the total repository data (which can be tens of gigabytes across all repos) is fine — it just means colder repos fall out of local cache and get re-fetched on next access, at the cost of that first access being slower.
+- **`--vfs-cache-max-age 24h`** — independent of the size cap, any cached file untouched for 24 hours is evicted regardless of how much headroom is left. This keeps the cache from quietly accumulating long-stale data for repos that were touched once and never again.
+- **`--file-perms 0755`** — this one is *not* just a permissions nicety, it's a functional requirement. Git hooks (`pre-receive`, `post-receive`, etc., which Forgejo relies on internally for enforcing branch protection, triggering webhooks, and updating its own internal state on push) are plain executable scripts inside a repo's `hooks/` directory, and Git invokes them directly — it needs the executable bit set. FUSE mounts don't inherently preserve or expose a meaningful executable bit the way a native filesystem does (permissions are often synthesized by the FUSE layer rather than read from the backing store, and S3 objects have no Unix permission bits at all), so without explicitly forcing `0755` on every file rclone presents through this mount, Forgejo's hooks would appear non-executable and silently fail to run.
+
+### Git Compatibility
+
+Git has a built-in safety mechanism: by default, it refuses to search upward past a filesystem boundary for a `.git` directory (this stops odd behavior like accidentally treating a mounted external drive as part of a repo that happens to sit above the mount point). The problem is that FUSE mounts *always* present as a distinct filesystem to the OS — they get their own device ID — even though from my perspective `/home/git/fjo-s3fs` is just as much "local storage" as the rest of `/home/git`. Left at its default, Git would refuse to operate correctly across that boundary.
+
+I fix this globally with:
+
+```bash
+export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+```
+
+set in the system environment for the `git` user, which tells Git that crossing filesystem boundaries during repository discovery is expected and safe here — because I know exactly what's on the other side of that boundary (my own S3 mount, not an untrusted external volume), the safety check this variable disables isn't protecting against anything in this setup.
 
 ### Forgejo Binary & Execution
 
-I manage the Forgejo executable manually. Instead of replacing the binary on every update and risking downtime, I download the versioned executable (e.g., `forgejo-x.x.x`) to `~/.local/bin/` and symlink it to `~/.local/bin/forgejo`.
+Forgejo ships as a single self-contained binary, which makes running it without containers straightforward — but I still don't just overwrite the binary in place on every upgrade. Instead:
 
-A user-level systemd service handles the execution, pointing directly to my configuration file:
-`/home/git/.local/bin/forgejo web --config /home/git/.config/forgejo/app.ini`
+1. Download each release as a versioned file: `~/.local/bin/forgejo-<version>` (e.g. `forgejo-11.0.7`).
+2. Symlink `~/.local/bin/forgejo` → the current version's binary.
+3. The systemd service always points at the stable `forgejo` symlink path, never at a version-specific filename.
 
-* I also export `GIT_DISCOVERY_ACROSS_FILESYSTEM=1` in the system environment. By default, Git stops searching for a repository directory when it hits a filesystem boundary as a security measure. Since FUSE mounts look like entirely different filesystems to the OS, this variable explicitly instructs Git that it is safe to cross into the `rclone` mount.
+Upgrading is then just: download the new versioned binary alongside the old one, flip the symlink, restart the service. The previous version's binary stays on disk untouched, so rolling back a bad upgrade is repointing the symlink back and restarting — no re-download, no redeploy, and no window where the binary path exists-but-is-half-written (which is a real risk if you `cp`/overwrite a binary that's currently the target of a running process's symlink or open file handle).
 
-### Directory Structure & SSH Access
+The service itself is a user-level systemd unit invoking:
 
-To connect the local Forgejo instance to the S3 mount seamlessly, I rely on simple symlinks without any complex configurations:
-* `/home/git/.local/var/lib/forgejo` points to `/home/git/fjo-s3fs/forgejo`
-* `/home/git/lfs` points to `/home/git/fjo-s3fs/lfs`
-* `/home/git/repositories` points to `/home/git/fjo-s3fs/repositories`
+```
+/home/git/.local/bin/forgejo web --config /home/git/.config/forgejo/app.ini
+```
 
-Finally, my Git SSH access is tightly locked down. I have added my personal SSH keys to the `git` user, ensuring that I am the sole individual capable of authenticating, pulling, and pushing code over the secure shell.
+— i.e. running Forgejo in `web` mode (serving HTTP + the built-in SSH server, rather than as a one-off CLI subcommand) against an explicit config path under `~/.config`, again following the XDG convention rather than Forgejo's alternate default of looking relative to its working directory or `/etc`.
 
----
+### Directory Structure
+
+Rather than pointing Forgejo's `app.ini` at S3-backed paths directly (which would couple Forgejo's config to the specific mount path and make it awkward to ever change the storage backend later), the S3 mount is stitched into the directories Forgejo actually expects via plain symlinks:
+
+- `/home/git/.local/var/lib/forgejo` → `/home/git/fjo-s3fs/forgejo` (Forgejo's application data directory — avatars, attachments, and other app-managed files)
+- `/home/git/lfs` → `/home/git/fjo-s3fs/lfs` (Git LFS object storage)
+- `/home/git/repositories` → `/home/git/fjo-s3fs/repositories` (the bare Git repositories themselves)
+
+Forgejo's configuration references the local-looking paths on the left; the fact that they resolve onto a FUSE-mounted S3 bucket is entirely transparent to Forgejo itself. This also means the mount point (`fjo-s3fs`) can be renamed, or the backing storage swapped for a different remote entirely, by only touching where the symlinks point — Forgejo's own config never needs to change.

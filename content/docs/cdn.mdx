@@ -3,42 +3,47 @@ title: CDN & Origin Shielding
 description: Edge caching and strict origin access control using AWS CloudFront.
 ---
 
-My infrastructure uses **AWS CloudFront** as the primary Content Delivery Network (CDN) to serve web traffic. The CDN acts as a reverse proxy, terminating client connections at the edge before forwarding secure requests to our origin server.
+My infrastructure uses **AWS CloudFront** as the CDN in front of web traffic that benefits from edge caching — currently static assets served from `cdn.jelius.dev`. CloudFront terminates the client's TLS connection at whichever edge location is geographically closest to them, serves the request straight from edge cache when it can, and only opens a connection back to the origin server (the actual VPS this all runs on) on a cache miss. This is the standard CDN value proposition — lower latency for visitors far from the origin, and far fewer requests actually reaching the origin server at all — but it also introduces a new problem worth solving deliberately: once a CDN is the intended front door, the origin itself becomes something that ideally should never be reachable directly.
+
+> All HTML/page traffic sits behind Cloudflare separately, in orange-cloud/proxied mode — that's a distinct path from the CloudFront setup described here, which specifically fronts the `cdn.jelius.dev` static-asset origin. The two aren't related beyond both being CDN layers in front of the same underlying VPS.
 
 ## Domain Configuration
 
-I utilize a dedicated alternate domain name (CNAME) in CloudFront for routing public HTTP/HTTPS traffic:
-*   **CDN Domain:** `cdn.jelius.dev`
-*   **Origin Domain:** The origin server utilizes the same base domain structure used for our [secure shell access](./ssh), actively listening for HTTPS traffic on port 443.
+*   **CDN Domain:** `cdn.jelius.dev` — the CloudFront distribution's alternate domain name (CNAME), covered by an ACM certificate so CloudFront can serve it over HTTPS with a certificate matching the actual hostname visitors see.
+*   **Origin Domain:** rather than pointing the CloudFront distribution's origin setting at a new, purpose-made hostname, it points at an existing subdomain that already resolves to the same VPS host — the same one used for [secure shell access](./ssh) — over HTTPS (port 443). Reusing an existing `A` record instead of minting a new "origin.jelius.dev"-style hostname avoids adding one more DNS entry and one more thing to keep in sync with the host's IP if it ever changes; the origin hostname itself has no special meaning to CloudFront beyond being a resolvable address with a valid cert behind it.
 
 ## Origin TLS & Certificate Rotation
 
-For CloudFront to securely communicate with the origin server, the origin itself must possess a valid, trusted SSL/TLS certificate. 
+CloudFront-to-origin traffic (the "custom origin" HTTPS connection CloudFront makes on a cache miss) requires the origin to present a certificate CloudFront's trust store accepts — a self-signed cert or plain HTTP won't do for a secure custom origin. 
 
-*   **Issuance:** We utilize `certbot` running in `standalone` mode to issue and bind the origin's certificate.
-*   **Automation:** Certificate rotation is completely automated via a system cron job. The cron job periodically checks the certificate's validity and triggers a renewal before expiration. 
+*   **Issuance:** `certbot` in `standalone` mode requests and binds the origin's certificate. Standalone mode means `certbot` runs its own temporary web server to complete the HTTP-01 ACME challenge, rather than relying on a webroot path served by an already-running web server or a DNS-01 challenge against a DNS provider's API. The practical implication is that whatever's normally bound to port 80/443 (the reverse proxy in front of the origin, e.g. Caddy/nginx) has to yield that port to `certbot` for the brief duration of each renewal — standalone mode can't share the port with a live server the way a webroot-based challenge can.
+*   **Automation:** renewal runs on a cron schedule that checks certificate validity and only actually renews when the cert is within its renewal window (Let's Encrypt certs are 90 days; `certbot renew` by convention only acts within roughly the last 30 days of validity, so a cron job can safely run daily/twice-daily without every run triggering a real renewal, rate limit, or the brief port-80/443 handoff described above).
 
-> For specifics on the underlying renewal logic and cron implementation, refer to the official [Certbot Renewal Documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal).
+    > For the underlying renewal logic and recommended cron/systemd-timer setup, see the official [Certbot Renewal Documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal) — not reproduced here since it's Certbot's own maintained reference, not something specific to this infra.
 
 ## Origin Shielding (Direct Access Prevention)
 
-To prevent actors from bypassing the CDN and hitting the origin server directly (e.g., via IP scanners), we enforce a strict **Custom Header Verification** mechanism.
+Once CloudFront is the intended entrypoint, the origin's IP and its direct hostname are still technically reachable by anyone who finds them (certificate transparency logs are a common way this leaks — any cert issued for a hostname, including the origin's, gets publicly logged whether or not that hostname is meant to be secret). Origin shielding is the layer that makes finding the origin useless even if someone does.
 
 ### The Verification Handshake
 
-1.  **Edge Injection:** When a legitimate request flows through CloudFront, the CDN is configured to inject a pre-shared cryptographic secret into a custom HTTP header.
-2.  **Origin Inspection:** The origin server inspects every incoming HTTPS request specifically for this header.
-3.  **Aggressive Enforcement:** If a request arrives without the correct secret header, the origin server does not gracefully return an HTTP error code (like `403 Forbidden`). Instead, it aggressively closes the client file descriptor (FD) and forcefully terminates the TCP connection.
+1.  **Edge injection:** the CloudFront distribution is configured to attach a custom HTTP header to every request it forwards to the origin, with a value that's a pre-shared secret known only to the CloudFront config and the origin server — this is CloudFront's built-in "custom origin headers" feature, not anything running in application code on the CloudFront side.
+2.  **Origin inspection:** the origin's reverse proxy (sitting in front of whatever actually serves the assets) checks every inbound HTTPS request for that exact header/value pair before doing anything else with the request.
+3.  **Aggressive enforcement on mismatch:** a request missing the header, or carrying the wrong value, doesn't get a `403 Forbidden` or any other ordinary HTTP error response. Instead the origin closes the underlying socket/file descriptor immediately, resetting the TCP connection rather than completing the HTTP exchange.
+
+The reason for that last, more aggressive step rather than a normal error code: an HTTP error response — even a `403` — still proves to a scanner that there's a real, correctly-configured HTTPS service listening and willing to have a conversation. That's enumerable and fingerprintable (it confirms "something is here, and it's speaking HTTP over TLS correctly"). Resetting the connection before completing the exchange denies that confirmation — from the outside, the origin looks like it's failing to respond at all, which is far less useful signal for anyone probing IP ranges or historical DNS records looking for exposed infrastructure. This pattern is commonly implemented as `return 444;` in nginx (nginx's non-standard "close without responding" pseudo-status), the origin however uses caddy for it's reverse proxy.
 
 ### Simulating a Bypass Attempt
 
-If a user or automated scanner attempts to send a direct request to the origin without traversing CloudFront, the server immediately drops the connection. 
-
-Attempting this via `curl` yields the following output:
+A direct request to the origin, bypassing CloudFront entirely (and therefore missing the injected header), demonstrates the drop:
 
 ```bash
 $ curl -I https://<ORIGIN_DOMAIN>
 curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)
 ```
 
-This strict enforcement ensures that our origin server remains completely unresponsive to unauthorized traffic, making it effectively invisible to the broader internet.
+The `HTTP/2 stream ... INTERNAL_ERROR` is `curl`'s way of reporting that the far end reset the stream mid-handshake rather than returning any HTTP response at all — consistent with the origin closing the connection at the TCP/stream level instead of the application level.
+
+### Defense in depth: what this does and doesn't cover
+
+Header verification stops requests that don't know the secret, anyone who *does* know a valid header value (e.g. it leaked) can still reach the origin directly. This mechanism is about hiding the origin from blind scanning and casual discovery. However, this is not an issue since my infrastructure does not serve sensitive data through CDNs; the only potential risk is a denial-of-wallet effect caused by high egress costs

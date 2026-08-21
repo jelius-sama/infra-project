@@ -6,7 +6,6 @@ const withMDX = createMDX();
 const config = {
   serverExternalPackages: ['@takumi-rs/core'],
   output: 'export',
-  basePath: "/infra-project",
   reactStrictMode: true,
 };
 

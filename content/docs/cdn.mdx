@@ -1,0 +1,44 @@
+---
+title: CDN & Origin Shielding
+description: Edge caching and strict origin access control using AWS CloudFront.
+---
+
+My infrastructure uses **AWS CloudFront** as the primary Content Delivery Network (CDN) to serve web traffic. The CDN acts as a reverse proxy, terminating client connections at the edge before forwarding secure requests to our origin server.
+
+## Domain Configuration
+
+I utilize a dedicated alternate domain name (CNAME) in CloudFront for routing public HTTP/HTTPS traffic:
+*   **CDN Domain:** `cdn.jelius.dev`
+*   **Origin Domain:** The origin server utilizes the same base domain structure used for our [secure shell access](./ssh), actively listening for HTTPS traffic on port 443.
+
+## Origin TLS & Certificate Rotation
+
+For CloudFront to securely communicate with the origin server, the origin itself must possess a valid, trusted SSL/TLS certificate. 
+
+*   **Issuance:** We utilize `certbot` running in `standalone` mode to issue and bind the origin's certificate.
+*   **Automation:** Certificate rotation is completely automated via a system cron job. The cron job periodically checks the certificate's validity and triggers a renewal before expiration. 
+
+> For specifics on the underlying renewal logic and cron implementation, refer to the official [Certbot Renewal Documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal).
+
+## Origin Shielding (Direct Access Prevention)
+
+To prevent actors from bypassing the CDN and hitting the origin server directly (e.g., via IP scanners), we enforce a strict **Custom Header Verification** mechanism.
+
+### The Verification Handshake
+
+1.  **Edge Injection:** When a legitimate request flows through CloudFront, the CDN is configured to inject a pre-shared cryptographic secret into a custom HTTP header.
+2.  **Origin Inspection:** The origin server inspects every incoming HTTPS request specifically for this header.
+3.  **Aggressive Enforcement:** If a request arrives without the correct secret header, the origin server does not gracefully return an HTTP error code (like `403 Forbidden`). Instead, it aggressively closes the client file descriptor (FD) and forcefully terminates the TCP connection.
+
+### Simulating a Bypass Attempt
+
+If a user or automated scanner attempts to send a direct request to the origin without traversing CloudFront, the server immediately drops the connection. 
+
+Attempting this via `curl` yields the following output:
+
+```bash
+$ curl -I https://<ORIGIN_DOMAIN>
+curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)
+```
+
+This strict enforcement ensures that our origin server remains completely unresponsive to unauthorized traffic, making it effectively invisible to the broader internet.

@@ -1,0 +1,47 @@
+---
+title: Forgejo Git Server
+description: Architecture and storage setup for my localized Forgejo instance.
+---
+
+My Git server is powered by Forgejo and uses a dedicated local [Postgres](./postgres) database. To maximize security and containment, the entire stack runs under a single localized `git` user. Absolutely no files or processes require root-level ownership, keeping the system securely compartmentalized in the `/home/git` directory.
+
+### Rclone & Storage Architecture
+
+All stateful data, including Forgejo data, LFS, and repositories, resides remotely in an S3 bucket. I mount this bucket directly to my local filesystem at `/home/git/fjo-s3fs` using `rclone` and FUSE. 
+
+Because this setup runs entirely in user-space, I use systemd lingering (`sudo loginctl enable-linger git`) to keep the user and its background services active continuously. If I need to check the status from my admin account, I can manage the mount service using `sudo systemctl --user -M git@ status fjo-s3fs`.
+
+### Cache & Git Compatibility
+
+To ensure high performance over the network, I aggressively cache the FUSE mount using the following `rclone` flags:
+
+```bash
+--file-perms 0755 \
+--vfs-cache-mode full \
+--vfs-write-back 5s \
+--cache-dir /home/git/.local/state/fjo-s3fs-cache \
+--vfs-cache-max-size 1500M \
+--vfs-cache-max-age 24h
+```
+
+* The `--file-perms 0755` flag is strictly required because Git needs executable permissions to run internal repository hooks.
+
+### Forgejo Binary & Execution
+
+I manage the Forgejo executable manually. Instead of replacing the binary on every update and risking downtime, I download the versioned executable (e.g., `forgejo-x.x.x`) to `~/.local/bin/` and symlink it to `~/.local/bin/forgejo`.
+
+A user-level systemd service handles the execution, pointing directly to my configuration file:
+`/home/git/.local/bin/forgejo web --config /home/git/.config/forgejo/app.ini`
+
+* I also export `GIT_DISCOVERY_ACROSS_FILESYSTEM=1` in the system environment. By default, Git stops searching for a repository directory when it hits a filesystem boundary as a security measure. Since FUSE mounts look like entirely different filesystems to the OS, this variable explicitly instructs Git that it is safe to cross into the `rclone` mount.
+
+### Directory Structure & SSH Access
+
+To connect the local Forgejo instance to the S3 mount seamlessly, I rely on simple symlinks without any complex configurations:
+* `/home/git/.local/var/lib/forgejo` points to `/home/git/fjo-s3fs/forgejo`
+* `/home/git/lfs` points to `/home/git/fjo-s3fs/lfs`
+* `/home/git/repositories` points to `/home/git/fjo-s3fs/repositories`
+
+Finally, my Git SSH access is tightly locked down. I have added my personal SSH keys to the `git` user, ensuring that I am the sole individual capable of authenticating, pulling, and pushing code over the secure shell.
+
+---

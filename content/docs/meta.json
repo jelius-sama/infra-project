@@ -1,0 +1,9 @@
+{
+    "pages": [
+        "---Infrastructure---",
+        "ssh",
+        "cdn",
+        "---Services---",
+        "git"
+    ]
+}

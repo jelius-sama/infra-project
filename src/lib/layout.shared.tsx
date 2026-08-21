@@ -1,5 +1,6 @@
-import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
-import { appName, gitConfig } from './shared';
+import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
+import { appName, gitConfig } from "@/lib/shared";
+import { ForgejoIcon } from "@/components/forgejo-icon";
 
 export function baseOptions(): BaseLayoutProps {
   return {
@@ -7,6 +8,13 @@ export function baseOptions(): BaseLayoutProps {
       // JSX supported
       title: appName,
     },
-    githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
+    links: [
+      {
+        type: "icon",
+        text: "Forgejo",
+        icon: <ForgejoIcon />,
+        url: `${gitConfig.domain}/${gitConfig.user}/${gitConfig.repo}`,
+      },
+    ],
   };
 }

@@ -1,13 +1,39 @@
 ---
-title: Hello World
-description: Your first document
+title: Infrastructure Overview
+description: Welcome to the documentation for my personal infrastructure, deployments, and configurations.
 ---
 
-Welcome to the docs! You can start writing documents in `/content/docs`.
+Welcome to my personal infrastructure documentation. I use this space to keep a detailed, up-to-date record of how my servers are configured, how traffic is routed, and how my self-hosted services operate.
 
-## What is Next?
+My setup is designed with security, compartmentalization, and performance in mind. Everything from network routing to Git operations is carefully scoped, strictly authorized, and isolated to prevent unauthorized access.
+
+### Core Architecture
+
+You can navigate through the sidebar, or jump directly into the primary areas of my setup below:
 
 <Cards>
-  <Card title="Learn more about Next.js" href="https://nextjs.org/docs" />
-  <Card title="Learn more about Fumadocs" href="https://fumadocs.dev" />
+  <Card 
+    title="SSH Configuration" 
+    description="My dual-port secure shell setup and restricted user access rules." 
+    href="/docs/ssh" 
+  />
+  <Card 
+    title="CDN & Origin Shielding" 
+    description="How I use CloudFront to cache edge traffic and actively drop direct server requests." 
+    href="/docs/cdn" 
+  />
+  <Card 
+    title="Forgejo Git Server" 
+    description="My localized Git server backed by aggressive rclone S3 FUSE mounts." 
+    href="/docs/git" 
+  />
+  <Card 
+    title="Postgres Database" 
+    description="The centralized database powering my backend services." 
+    href="/docs/postgres" 
+  />
 </Cards>
+
+### About this Portal
+
+This documentation site is built using Fumadocs. It is completely statically generated and hosted via GitHub Pages, ensuring it remains fast, reliable, and entirely decoupled from the actual origin infrastructure it documents.

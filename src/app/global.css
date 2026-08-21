@@ -1,6 +1,6 @@
-@import 'tailwindcss';
-@import 'fumadocs-ui/css/neutral.css';
-@import 'fumadocs-ui/css/preset.css';
+@import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
 
 html {
   scrollbar-gutter: stable;
@@ -9,4 +9,85 @@ html {
 html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
+}
+
+/* Catppuccin Latte (light) */
+:root {
+  --color-fd-background: #eff1f5;
+  --color-fd-foreground: #4c4f69;
+  --color-fd-muted: #ccd0da;
+  --color-fd-muted-foreground: #6c6f85;
+  --color-fd-popover: #e6e9ef;
+  --color-fd-popover-foreground: #4c4f69;
+  --color-fd-card: #e6e9ef;
+  --color-fd-card-foreground: #4c4f69;
+  --color-fd-border: #bcc0cc;
+  --color-fd-primary: #8839ef;
+  --color-fd-primary-foreground: #eff1f5;
+  --color-fd-secondary: #ccd0da;
+  --color-fd-secondary-foreground: #4c4f69;
+  --color-fd-accent: #bcc0cc;
+  --color-fd-accent-foreground: #4c4f69;
+  --color-fd-ring: #8839ef;
+
+  --cat-red: #d20f39;
+  --cat-yellow: #df8e1d;
+  --cat-green: #40a02b;
+  --cat-teal: #179299;
+  --cat-blue: #1e66f5;
+  --cat-mauve: #8839ef;
+  --cat-peach: #fe640b;
+  --cat-lavender: #7287fd;
+  --cat-rosewater: #dc8a78;
+}
+
+/* Catppuccin Mocha (dark) */
+.dark {
+  --color-fd-background: #1e1e2e;
+  --color-fd-foreground: #cdd6f4;
+  --color-fd-muted: #313244;
+  --color-fd-muted-foreground: #a6adc8;
+  --color-fd-popover: #181825;
+  --color-fd-popover-foreground: #cdd6f4;
+  --color-fd-card: #181825;
+  --color-fd-card-foreground: #cdd6f4;
+  --color-fd-border: #45475a;
+  --color-fd-primary: #cba6f7;
+  --color-fd-primary-foreground: #1e1e2e;
+  --color-fd-secondary: #313244;
+  --color-fd-secondary-foreground: #cdd6f4;
+  --color-fd-accent: #45475a;
+  --color-fd-accent-foreground: #cdd6f4;
+  --color-fd-ring: #cba6f7;
+
+  --cat-red: #f38ba8;
+  --cat-yellow: #f9e2af;
+  --cat-green: #a6e3a1;
+  --cat-teal: #94e2d5;
+  --cat-blue: #89b4fa;
+  --cat-mauve: #cba6f7;
+  --cat-peach: #fab387;
+  --cat-lavender: #b4befe;
+  --cat-rosewater: #f5e0dc;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }

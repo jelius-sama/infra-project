@@ -1,11 +1,12 @@
-export const appName = 'My App';
-export const docsRoute = '/docs';
-export const docsImageRoute = '/og/docs';
-export const docsContentRoute = '/llms.mdx/docs';
+// export const appName = "Basumatary Systems";
+export const appName = "jelius/infra";
+export const docsRoute = "/docs";
+export const docsImageRoute = "/og/docs";
+export const rawContentRoute = "/raw";
 
-// fill this with your actual GitHub info, for example:
 export const gitConfig = {
-  user: 'fuma-nama',
-  repo: 'fumadocs',
-  branch: 'main',
+  domain: "https://git.jelius.dev",
+  user: "jelius-sama",
+  repo: "infra-project",
+  branch: "main",
 };

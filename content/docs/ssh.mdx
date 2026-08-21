@@ -1,0 +1,31 @@
+---
+title: SSH & Access Configuration
+description: Architecture and access rules for secure shell and Git operations.
+---
+
+My infrastructure utilizes a customized, dual-port SSH configuration. Instead of connecting via direct IP addresses, SSH traffic is routed through designated subdomains. 
+
+## Architecture Overview
+
+I expose SSH on two distinct ports, each serving a highly specific and restricted purpose. 
+
+### Port 22: Secure Monitoring 
+The default SSH port (22) is open but is intentionally stripped of traditional shell capabilities. 
+
+*   **Access Level:** Zero interactive shell access.
+*   **Functionality:** Successfully authenticating on this port immediately launches the `btop` resource monitor. It acts purely as a secure monitoring terminal. Once the `btop` process is exited, the SSH connection automatically terminates.
+
+### Port 69: Git & Administration
+The actual secure shell daemon listens on a non-standard port (69). This is the primary port for Git operations as well as direct machine access. 
+
+Access on this port is strictly segregated by the authenticated user role:
+
+#### 1. Git Operations (`git` user)
+*   **Endpoint:** `git@git.jelius.dev`
+*   **Access Level:** Git commands only.
+*   **Behavior:** Similar to standard managed Git providers, attempting to open a standard shell session as the `git` user will successfully authenticate, display a connection success message, and immediately reject shell access.
+
+#### 2. Administrative Access
+*   **Endpoint:** `<ADMIN_USER>@<INTERNAL_SUBDOMAIN>`
+*   **Access Level:** Full interactive shell access.
+*   **Behavior:** Only the explicitly designated administrative user holds the privileges required to spawn a standard bash/zsh shell for infrastructure maintenance.

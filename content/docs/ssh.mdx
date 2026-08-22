@@ -3,39 +3,41 @@ title: SSH & Access Configuration
 description: Architecture and access rules for secure shell and Git operations.
 ---
 
-My infrastructure uses a customized, dual-port SSH configuration where each port has a single, narrowly-scoped purpose rather than exposing one general-purpose shell daemon. Traffic is also addressed by subdomain (`git.jelius.dev`, an internal admin subdomain) rather than by raw IP — the usual DNS-indirection benefit applies here: the underlying host's IP can change without anyone needing to update how they connect, and it keeps every service's access point self-documenting instead of a list of IPs to remember.
+I run a customized, dual-port SSH setup, but instead of just opening up a general-purpose shell daemon to the world, I gave each port a very specific, narrowly-scoped job. I also route traffic through subdomains (like `git.jelius.dev`) rather than raw IP addresses. Why? Mostly so I don't have to memorize IPs, but it also means the underlying host IP can change without breaking everyone's Git config. Plus, it makes the access points naturally self-documenting.
 
-Note that SSH is fundamentally different from the HTTP(S) traffic described in [CDN & Origin Shielding](/docs/cdn#domain-configuration) — CloudFront and Cloudflare proxy Layer 7 HTTP(S) requests, but SSH is a raw TCP protocol they don't (and can't, without a TCP-layer product like AWS Global Accelerator) front. Both SSH subdomains resolve directly to the host via plain `A` records; there's no CDN or edge layer sitting in front of either SSH port.
+Note that SSH is fundamentally different from the Layer 7 HTTP(S) traffic I outlined in [CDN & Origin Shielding](/docs/cdn#domain-configuration). CloudFront and Cloudflare can easily proxy HTTP, but SSH is a raw TCP protocol. Because of that, both SSH subdomains resolve directly to the host via plain `A` records—there is no CDN sitting in front of these ports.
 
 ## Architecture Overview
 
-Both ports are handled by the same underlying `sshd`, distinguished by separate `Port` directives with per-port `Match` blocks.
+Both ports are handled by the exact same underlying `sshd` service, separated simply by `Port` directives and per-port `Match` blocks in the config.
 
 ### Port 22: Secure Monitoring
 
-The default SSH port is left open rather than closed or filtered — closing it entirely would just push scanner noise to logs elsewhere and gains little, since port 22 gets scanned relentlessly by internet-wide bots regardless of whether anything real is behind it. Instead of hiding it, I gave it something intentionally harmless to find.
+I left port 22 open on purpose. Closing it entirely just pushes automated scanner noise to logs elsewhere, since internet-wide bots are going to relentlessly hammer port 22 regardless of whether anything real is behind it. So, instead of hiding it, I gave them a toy to play with.
 
-*   **Access Level:** Zero interactive shell access, for any authenticated user on this port.
-*   **Functionality:** A successful key-based authentication on port 22 doesn't drop the client into a shell at all — `sshd` is configured with `ForceCommand btop` (plus `PermitTTY yes`, since `btop`'s TUI needs a real pseudo-terminal to render into), so the *only* thing that can ever run in that session is the `btop` resource monitor. There's no shell underneath it to escape into via normal means — the SSH session's program *is* `btop`, not a shell running `btop`.
-*   **Exit behavior:** When `btop` exits (`q`, or the client disconnects), the forced command's process exits, and `sshd` tears down the session immediately — there's no shell left behind to fall through to, because none was ever started.
+*   **Access Level:** Zero interactive shell access. Period.
+*   **Functionality:** If you actually manage to authenticate with a key on port 22, you do not get a shell. I configured `sshd` with `ForceCommand btop` (and `PermitTTY yes` so the TUI actually renders). The *only* thing that can ever run in that session is the `btop` resource monitor. There is no bash shell underneath it to escape into—the SSH session's program *is* `btop`.
+*   **Exit behavior:** The moment `btop` exits (via `q` or a disconnect), the forced command's process ends, and `sshd` immediately tears down the session. There is no shell left behind to fall through to, because one never existed in the first place.
 
-The practical effect: this port is a genuinely useful, at-a-glance system monitor reachable from anywhere I have my key, while giving a scanner or opportunistic attacker nothing to act on even *after* successful authentication — the strongest exposure here is read-only visibility into system resource usage, not shell access.
+The practical effect? I get a genuinely useful, at-a-glance system monitor from anywhere I have my key. Meanwhile, a scanner or opportunistic attacker gets absolutely nothing except read-only visibility into how much RAM they are currently wasting.
 
 ### Port 69: Git & Administration
 
-The actual functional SSH daemon — the one used for real work — listens on a non-standard, unprivileged high-numbered-sounding-but-actually-low port: **69**. Moving the "real" daemon off port 22 mainly serves to cut down on log noise and reduce the number of automated exploitation attempts specifically targeting an obviously-live, general-purpose SSH port; it is not itself a security control (this is the textbook "security through obscurity" caveat — real enforcement is still key-only auth, the per-user `Match` restrictions below, and `fail2ban`/rate-limiting sitting on top). Port 69 is conventionally the well-known port for TFTP (a UDP-based protocol), which is unrelated here — reusing the number is coincidental/for memorability, not a protocol collision, since this is TCP/SSH, not TFTP.
+The *real* functional SSH daemon—the one I use for actual work—listens on a non-standard, unprivileged port: **69**. 
 
-Access on this port is segregated entirely by which user authenticates — the same `sshd` instance, but a different `Match User` block per identity, each with different forced behavior:
+Moving the real daemon off port 22 mostly serves to cut down on log noise and automated brute-force attempts targeting standard SSH setups. It isn't a security control by itself (textbook "security through obscurity"), as the real enforcement is still key-only auth, strict user restrictions, and `fail2ban` watching the gates.
+
+Access on this port is segregated entirely by which user authenticates:
 
 #### 1. Git Operations (`git` user)
 
-*   **Endpoint:** `git@git.jelius.dev` (port 69)
-*   **Access Level:** Git wire-protocol commands only — no shell, no arbitrary command execution.
-*   **Behavior:** Authenticating and immediately closing (e.g. `ssh git@git.jelius.dev`, no command) prints a success/identity banner (Forgejo's version of GitHub's familiar "Hi \<user\>! You've successfully authenticated, but GitHub does not provide shell access.") and disconnects — confirming the key works without granting anything beyond that confirmation.
+*   **Endpoint:** `git@git.jelius.dev`
+*   **Access Level:** Git wire-protocol commands only. No arbitrary command execution.
+*   **Behavior:** If you try to SSH in normally (`ssh git@git.jelius.dev`), the server prints a success banner—Forgejo's polite way of saying "Hi! You successfully authenticated, but we don't provide shells"—and instantly kicks you out. It confirms your key works without actually giving you the keys to the kingdom.
 
 #### 2. Administrative Access
 
-*   **Endpoint:** `<ADMIN_USER>@<INTERNAL_SUBDOMAIN>` (port 69)
-*   **Access Level:** Full interactive shell (bash/zsh) — the only identity on this entire dual-port setup with that privilege.
-*   **Mechanism:** The admin user's `Match User` block has no `ForceCommand` at all, so a normal login shell is granted exactly as it would be on any ordinary server. Everything restrictive described above is specific to the `git` and port-22-monitoring identities — the admin account is deliberately the one exception.
-*   **Why a separate internal subdomain rather than reusing `git.jelius.dev`:** keeping the admin entrypoint on its own hostname (not advertised anywhere the `git` clone URL is) means it doesn't show up in the one place (Git remotes, clone instructions) that's meant to be shared or public-facing at all.
+*   **Endpoint:** `<ADMIN_USER>@<INTERNAL_SUBDOMAIN>`
+*   **Access Level:** Full interactive shell (bash/zsh). This is the only identity on this entire dual-port setup with this privilege.
+*   **Mechanism:** My admin user's `Match User` block has no `ForceCommand` at all, meaning I get a normal login shell exactly as you would on any ordinary server. All those paranoid restrictions above are specifically for the `git` identity and the port 22 honeypot. My admin account is deliberately the one exception.
+*   **Why a separate internal subdomain?** Keeping the admin entrypoint on its own hostname (which isn't advertised anywhere near the `git` clone URL) ensures it doesn't show up in the one place meant to be public-facing. It keeps the actual maintenance door completely off the radar.
